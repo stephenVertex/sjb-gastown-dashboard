@@ -7,7 +7,7 @@ SOCKET="${1:-gt-be7f79}"
 WATCH_PATH="${2:-$SCRIPT_DIR/tmux_window_ages.py}"
 
 while true; do
-  uv run "$SCRIPT_DIR/tmux_window_ages.py" "$SOCKET" &
+  uv run "$SCRIPT_DIR/tmux_window_ages.py" --textual "$SOCKET" &
   pid=$!
 
   fswatch -1 "$WATCH_PATH"

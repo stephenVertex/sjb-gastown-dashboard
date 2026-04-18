@@ -12,6 +12,15 @@ Requires Python 3.14+ and `rich`.
 uv run tmux_window_ages.py
 ```
 
+Textual sessions panel mode:
+
+```bash
+uv run tmux_window_ages.py --textual <socket-name>
+```
+
+This mode renders the main sessions grid as a `DataTable` with live refresh,
+search (`/` or `s`), and Enter-to-open row details.
+
 ### tmux_window_ages_live.sh
 Wrapper to run the dashboard in live/polling mode against a specific tmux socket.
 

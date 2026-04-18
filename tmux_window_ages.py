@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["rich"]
+# dependencies = ["rich", "textual"]
 # ///
 import json
 import os
@@ -24,6 +24,12 @@ from rich.columns import Columns
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Input, Static
 
 POLL_INTERVAL = 5
 CMD_HISTORY = 8
@@ -41,6 +47,7 @@ PR_TABLE_LINES = 12
 MAX_ORPHAN_BRANCHES_PER_RIG = 3
 RECENTLY_CLOSED_LINES = 8
 CLOSED_LOOKBACK_DAYS = 2
+SEARCH_LIMIT = 200
 
 # -- LLM session summary settings --
 LLM_SUMMARY_INTERVAL = 30  # seconds between LLM summary refreshes
@@ -884,6 +891,340 @@ def activity_label(score: int) -> tuple[str, str]:
     return ("zoom", "red")
 
 
+def session_status(session: str, score: int) -> tuple[str, str]:
+    role = session.split("-", 1)[1] if "-" in session else session
+    lowered = role.lower()
+    if "zombie" in lowered or "dead" in lowered:
+        return ("dead/zombie", "red")
+    if any(word in lowered for word in ("done", "complete", "completed")):
+        return ("completed", "dim")
+    if score == 0:
+        return ("idle", "yellow")
+    return ("active", "green")
+
+
+def markup_to_plain(value: str) -> str:
+    return re.sub(r"\[[^\]]+\]", "", value or "")
+
+
+def title_history_text(history: deque[tuple[str, str]]) -> str:
+    if not history:
+        return "No title changes captured."
+    return "\n".join(f"{stamp}  {title or '(empty)'}" for stamp, title in list(history)[-8:])
+
+
+def command_history_text(history: deque[str]) -> str:
+    if not history:
+        return "No command history captured."
+    return "\n".join(list(history)[-CMD_HISTORY:])
+
+
+def activity_timeline_text(history: deque[int]) -> str:
+    if not history:
+        return "No activity yet."
+    labels = [activity_label(score)[0] for score in history]
+    return "  ".join(labels)
+
+
+def detail_text(
+    socket: str,
+    session: str,
+    idx: str,
+    window_name: str,
+    cmd: str,
+    path: str,
+    title: str,
+    bead_id: str,
+    age_str: str,
+    status_label: str,
+    llm_summary: str,
+    pane_snapshot: str,
+    cmd_history: deque[str],
+    title_history: deque[tuple[str, str]],
+    activity_history: deque[int],
+) -> str:
+    lines = [
+        f"Session: {session}",
+        f"Rig: {session.split('-', 1)[0] if '-' in session else session}",
+        f"Window: {idx} ({window_name})",
+        f"Command: {cmd}",
+        f"Path: {path}",
+        f"Title: {title}",
+        f"Bead: {bead_id or '-'}",
+        f"Age: {age_str}",
+        f"Status: {status_label}",
+        f"LLM Summary: {llm_summary or '-'}",
+        "",
+        "Pane Snapshot",
+        pane_snapshot.strip() or "(empty pane)",
+        "",
+        "Command History",
+        command_history_text(cmd_history),
+        "",
+        "Title History",
+        title_history_text(title_history),
+        "",
+        "Activity Timeline",
+        activity_timeline_text(activity_history),
+        "",
+        f"tmux target: {socket}:{session}:{idx}",
+    ]
+    return "\n".join(lines)
+
+
+def row_key(session: str, idx: str) -> str:
+    return f"{session}:{idx}"
+
+
+class SearchScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+
+    def __init__(self, rows: list[tuple[str, str, str]]) -> None:
+        super().__init__()
+        self.rows = rows
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Input(placeholder="Search session, rig, bead, or title", id="search-input"),
+            Static(id="search-results"),
+            id="search-modal",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#search-input", Input).focus()
+        self._update_results("")
+
+    @on(Input.Changed, "#search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._update_results(event.value)
+
+    @on(Input.Submitted, "#search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip().lower()
+        matches = self._matches(query)
+        self.dismiss(matches[0][0] if matches else None)
+
+    def _matches(self, query: str) -> list[tuple[str, str, str]]:
+        if not query:
+            return self.rows[:SEARCH_LIMIT]
+        return [row for row in self.rows if query in row[1].lower() or query in row[2].lower()][
+            :SEARCH_LIMIT
+        ]
+
+    def _update_results(self, query: str) -> None:
+        matches = self._matches(query.strip().lower())
+        body = "\n".join(row[2] for row in matches) if matches else "No matches"
+        self.query_one("#search-results", Static).update(body)
+
+
+class SessionsTableApp(App[None]):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+
+    #body {
+        height: 1fr;
+    }
+
+    #sessions {
+        height: 1fr;
+    }
+
+    #detail {
+        width: 42;
+        padding: 1;
+        overflow-y: auto;
+        border: round $accent;
+    }
+
+    #search-modal {
+        width: 90;
+        height: 24;
+        padding: 1;
+        border: round $accent;
+        background: $surface;
+    }
+
+    #search-results {
+        height: 1fr;
+        overflow-y: auto;
+        padding-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("enter", "open_selected", "Open"),
+        Binding("s", "open_search", "Search"),
+        Binding("slash", "open_search", "Search"),
+        Binding("r", "refresh_rows", "Refresh"),
+        Binding("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, socket: str, interval: int, wrap_title: bool = False) -> None:
+        super().__init__()
+        self.socket = socket
+        self.interval = interval
+        self.wrap_title = wrap_title
+        self.birth_times, self.cmd_histories, self.title_histories, self.death_log = load_state(socket)
+        self.pane_snapshots: dict[str, str] = {}
+        self.activity_histories: dict[tuple[str, str], deque[int]] = {}
+        self.row_to_detail: dict[str, str] = {}
+        self.search_rows: list[tuple[str, str, str]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Horizontal(
+            DataTable(id="sessions", zebra_stripes=True, cursor_type="row"),
+            Static("Loading sessions...", id="detail"),
+            id="body",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#sessions", DataTable)
+        table.add_columns("SESSION", "RIG", "WINDOW", "AGE", "STATUS", "BEAD", "CMD", "TITLE", "LLM SUMMARY")
+        self.set_interval(self.interval, self.refresh_rows)
+        self.refresh_rows()
+
+    def refresh_rows(self) -> None:
+        now = datetime.now()
+        windows = list_all_windows(self.socket)
+
+        for key, (_name, cmd, _path, title, pane_id) in windows.items():
+            if key not in self.birth_times:
+                self.birth_times[key] = now
+            hist = self.cmd_histories.setdefault(key, deque(maxlen=CMD_HISTORY))
+            if not hist or hist[-1] != cmd:
+                hist.append(cmd)
+            title_hist = self.title_histories.setdefault(key, deque(maxlen=TITLE_HISTORY))
+            if not title_hist or title_hist[-1][1] != title:
+                title_hist.append((now.strftime("%H:%M:%S"), title))
+            current_snapshot = capture_pane_text(self.socket, f"{key[0]}:{key[1]}")
+            previous_snapshot = self.pane_snapshots.get(pane_id, "")
+            score = measure_activity(previous_snapshot, current_snapshot)
+            self.pane_snapshots[pane_id] = current_snapshot
+            self.activity_histories.setdefault(key, deque(maxlen=ACTIVITY_HISTORY)).append(score)
+
+        for key in set(self.birth_times) - set(windows):
+            age_secs = (now - self.birth_times[key]).total_seconds()
+            self.death_log.append((now.strftime("%H:%M:%S"), row_key(*key), fmt_age(age_secs)))
+            del self.birth_times[key]
+            self.cmd_histories.pop(key, None)
+            self.title_histories.pop(key, None)
+            self.activity_histories.pop(key, None)
+
+        bead_assignments = load_bead_assignments()
+        in_progress_beads, queued_beads = load_bead_status_tables()
+        active_bead_ids = {issue_id for _, issue_id, _ in in_progress_beads + queued_beads}
+
+        table = self.query_one("#sessions", DataTable)
+        table.clear(columns=False)
+        self.row_to_detail.clear()
+        self.search_rows.clear()
+
+        current_prefix = None
+        for session, idx in sorted(self.birth_times, key=lambda k: (k[0], self.birth_times[k])):
+            prefix = session.split("-")[0] if "-" in session else session
+            if current_prefix is not None and prefix != current_prefix:
+                separator = f"{prefix} separator"
+                table.add_row("", "", "", "", "", "", "", separator, "", key=f"sep-{prefix}-{idx}", height=1)
+            current_prefix = prefix
+
+            name, cmd, path, title, pane_id = windows.get((session, idx), ("???", "???", "???", "???", ""))
+            age_secs = (now - self.birth_times[(session, idx)]).total_seconds()
+            age_str = fmt_age(age_secs)
+            activity_scores = self.activity_histories.get((session, idx), deque())
+            avg_activity = int(sum(activity_scores) / len(activity_scores)) if activity_scores else 0
+            status_label, _status_color = session_status(session, avg_activity)
+            bead_id = markup_to_plain(bead_for_session(session, path, bead_assignments))
+            if bead_id and bead_id not in active_bead_ids:
+                bead_id = f"{bead_id} (stale)"
+            llm_summary = get_session_summary(session)
+            display_name = "claude" if name == "node" else name
+            display_title = title if self.wrap_title else shorten_text(title or "", 84)
+            if path and not path.startswith(HOME_GT):
+                display_title = shorten_path(path, 60)
+
+            key_value = row_key(session, idx)
+            table.add_row(
+                session,
+                prefix,
+                f"{idx} {display_name}",
+                age_str,
+                status_label,
+                bead_id,
+                cmd,
+                display_title,
+                llm_summary,
+                key=key_value,
+            )
+
+            detail = detail_text(
+                self.socket,
+                session,
+                idx,
+                name,
+                cmd,
+                path,
+                title,
+                bead_id,
+                age_str,
+                status_label,
+                llm_summary,
+                self.pane_snapshots.get(pane_id, ""),
+                self.cmd_histories.get((session, idx), deque()),
+                self.title_histories.get((session, idx), deque()),
+                self.activity_histories.get((session, idx), deque()),
+            )
+            self.row_to_detail[key_value] = detail
+            self.search_rows.append(
+                (
+                    key_value,
+                    " ".join([session, prefix, bead_id, title or "", llm_summary or ""]),
+                    f"{session:<20} {prefix:<8} {bead_id:<14} {title or '-'}",
+                )
+            )
+
+        if table.row_count:
+            first_key = next(iter(self.row_to_detail), None)
+            if first_key:
+                table.move_cursor(row=0)
+                self.query_one("#detail", Static).update(self.row_to_detail[first_key])
+        else:
+            self.query_one("#detail", Static).update("No tmux windows found.")
+
+        save_state(self.socket, self.birth_times, self.cmd_histories, self.title_histories, self.death_log)
+
+    def action_refresh_rows(self) -> None:
+        self.refresh_rows()
+
+    def action_open_selected(self) -> None:
+        table = self.query_one("#sessions", DataTable)
+        if table.cursor_row is None:
+            return
+        row_key_value = table.get_row_key(table.cursor_row)
+        if row_key_value is not None and row_key_value.value in self.row_to_detail:
+            self.query_one("#detail", Static).update(self.row_to_detail[row_key_value.value])
+
+    async def action_open_search(self) -> None:
+        result = await self.push_screen_wait(SearchScreen(self.search_rows))
+        if not result:
+            return
+        table = self.query_one("#sessions", DataTable)
+        for row_index in range(table.row_count):
+            row_key_value = table.get_row_key(row_index)
+            if row_key_value is not None and row_key_value.value == result:
+                table.move_cursor(row=row_index)
+                self.query_one("#detail", Static).update(self.row_to_detail[result])
+                break
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        row_key_value = event.row_key.value
+        if row_key_value in self.row_to_detail:
+            self.query_one("#detail", Static).update(self.row_to_detail[row_key_value])
+
+
 def build_table(
     socket: str,
     interval: int,
@@ -1216,10 +1557,19 @@ def main():
     parser.add_argument(
         "--wrap", action="store_true", help="wrap TITLE column to show full text"
     )
+    parser.add_argument(
+        "--textual",
+        action="store_true",
+        help="run the sessions panel as a Textual DataTable app",
+    )
     args = parser.parse_args()
 
     socket = args.socket
     interval = args.poll_interval
+
+    if args.textual:
+        SessionsTableApp(socket, interval, wrap_title=args.wrap).run()
+        return
 
     birth_times, cmd_histories, title_histories, death_log = load_state(socket)
     pane_snapshots: dict[str, str] = {}
