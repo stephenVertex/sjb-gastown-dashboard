@@ -17,6 +17,7 @@ from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
 from dashboard_data import DashboardDataStore, DashboardSnapshot, POLL_INTERVAL, fmt_age
+from rigs_screen import RigsScreen
 
 
 def format_rows(rows: list[tuple[str, str, str]], empty: str, limit: int) -> str:
@@ -75,6 +76,8 @@ class DashboardCommands(Provider):
             if query and query.lower() not in panel_id:
                 continue
             hits.add(Hit(panel_id, help_text, lambda panel_id=panel_id: app.action_focus_panel(panel_id)))
+        if not query or query.lower() in "rigs":
+            hits.add(Hit("rigs", "Open rigs screen", lambda: app.action_show_rigs()))
         return hits
 
 
@@ -115,6 +118,7 @@ class GastownDashboard(App):
         Binding("4", "focus_panel('closed')", "Closed"),
         Binding("5", "focus_panel('detail')", "Detail"),
         Binding("6", "focus_panel('prs')", "PRs"),
+        Binding("r", "show_rigs", "Rigs"),
     ]
 
     snapshot: reactive[DashboardSnapshot | None] = reactive(None)
@@ -155,6 +159,9 @@ class GastownDashboard(App):
 
     def action_focus_panel(self, panel_id: str) -> None:
         self.query_one(f"#{panel_id}", VerticalScroll).focus()
+
+    def action_show_rigs(self) -> None:
+        self.push_screen(RigsScreen())
 
     def refresh_data(self) -> None:
         self.snapshot = self.store.refresh()
