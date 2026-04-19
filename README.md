@@ -19,7 +19,9 @@ uv run tmux_window_ages.py --textual <socket-name>
 ```
 
 This mode renders the main sessions grid as a `DataTable` with live refresh,
-search (`/` or `s`), and Enter-to-open row details.
+search (`/` or `s`), Enter-to-open session drill-down screens, `b` for bead
+detail search, and `p` for PR detail search. Detail screens support Escape to
+return and in-detail search with `/` or `s`.
 
 ### tmux_window_ages_live.sh
 Wrapper to run the dashboard in live/polling mode against a specific tmux socket.

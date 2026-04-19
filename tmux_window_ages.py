@@ -28,7 +28,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 POLL_INTERVAL = 5
@@ -48,6 +48,17 @@ MAX_ORPHAN_BRANCHES_PER_RIG = 3
 RECENTLY_CLOSED_LINES = 8
 CLOSED_LOOKBACK_DAYS = 2
 SEARCH_LIMIT = 200
+
+
+def plain_text_lines(value: str) -> list[str]:
+    return value.splitlines() or [""]
+
+
+def filter_detail_lines(lines: list[str], query: str) -> list[str]:
+    if not query:
+        return lines
+    lowered = query.lower()
+    return [line for line in lines if lowered in line.lower()]
 
 # -- LLM session summary settings --
 LLM_SUMMARY_INTERVAL = 30  # seconds between LLM summary refreshes
@@ -972,6 +983,212 @@ def detail_text(
     return "\n".join(lines)
 
 
+def load_bead_detail_text(bead_id: str) -> str:
+    for rig_dir in sorted(GT_ROOT.iterdir()):
+        if not rig_dir.is_dir():
+            continue
+        beads_root = rig_dir / "mayor" / "rig"
+        if not beads_root.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["bd", "show", bead_id, "--long"],
+                capture_output=True,
+                text=True,
+                cwd=str(beads_root),
+                timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return f"Bead {bead_id} not found."
+
+
+def parse_pr_number(value: str) -> int | None:
+    if not value.startswith("#"):
+        return None
+    try:
+        return int(value[1:])
+    except ValueError:
+        return None
+
+
+def load_pr_detail_text(rig_name: str, identifier: str) -> str:
+    repo_git = GT_ROOT / rig_name / ".repo.git"
+    if not repo_git.exists():
+        return f"No repository metadata found for rig {rig_name}."
+
+    url_result = subprocess.run(
+        ["git", "--git-dir", str(repo_git), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if url_result.returncode != 0:
+        return f"Unable to resolve origin remote for rig {rig_name}."
+
+    repo_slug = parse_github_repo(url_result.stdout.strip())
+    if not repo_slug:
+        return f"Unable to parse GitHub repo from origin for rig {rig_name}."
+
+    number = parse_pr_number(identifier)
+    if number is None:
+        return f"No open PR exists for {identifier}."
+
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo_slug,
+                "--json",
+                "title,body,author,url,reviewDecision,statusCheckRollup,files,reviews",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"Failed to load PR #{number}: {exc}"
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "unknown gh error"
+        return f"Failed to load PR #{number}: {stderr}"
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return f"Failed to parse PR #{number} details."
+
+    title = data.get("title", "")
+    body = (data.get("body") or "").strip()
+    author = ((data.get("author") or {}).get("login")) or "unknown"
+    url = data.get("url", "")
+    review_decision = data.get("reviewDecision") or "PENDING"
+    checks = data.get("statusCheckRollup") or []
+    reviews = data.get("reviews") or []
+    files = data.get("files") or []
+
+    lines = [f"PR: #{number}  {title}", f"Author: {author}", f"Review State: {review_decision}"]
+    if url:
+        lines.append(f"Browser: {url}")
+
+    lines.append("")
+    lines.append("CI Checks")
+    if checks:
+        for check in checks:
+            name = check.get("name") or check.get("context") or "check"
+            status = check.get("conclusion") or check.get("status") or "UNKNOWN"
+            lines.append(f"- {name}: {status}")
+    else:
+        lines.append("- No CI checks reported")
+
+    lines.append("")
+    lines.append("Reviews")
+    if reviews:
+        for review in reviews[:12]:
+            author_name = ((review.get("author") or {}).get("login")) or "unknown"
+            state = review.get("state") or "COMMENTED"
+            body_preview = (review.get("body") or "").strip().splitlines()
+            preview = body_preview[0] if body_preview else ""
+            if preview:
+                lines.append(f"- {author_name}: {state} - {preview}")
+            else:
+                lines.append(f"- {author_name}: {state}")
+    else:
+        lines.append("- No reviews yet")
+
+    lines.append("")
+    lines.append(f"Files Changed ({len(files)})")
+    if files:
+        for changed_file in files[:40]:
+            path = changed_file.get("path") or "unknown"
+            additions = changed_file.get("additions", 0)
+            deletions = changed_file.get("deletions", 0)
+            lines.append(f"- {path} (+{additions}/-{deletions})")
+    else:
+        lines.append("- No files reported")
+
+    lines.append("")
+    lines.append("Body")
+    lines.append(body or "(no body)")
+    return "\n".join(lines)
+
+
+class DetailSearchScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+
+    def __init__(self, content: str) -> None:
+        super().__init__()
+        self.lines = plain_text_lines(content)
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Input(placeholder="Search within detail content", id="detail-search-input"),
+            Static(id="detail-search-results"),
+            id="search-modal",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#detail-search-input", Input).focus()
+        self._update_results("")
+
+    @on(Input.Changed, "#detail-search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._update_results(event.value)
+
+    @on(Input.Submitted, "#detail-search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip()
+        if not query:
+            self.dismiss(None)
+            return
+        matches = filter_detail_lines(self.lines, query)
+        self.dismiss(query if matches else None)
+
+    def _update_results(self, query: str) -> None:
+        matches = filter_detail_lines(self.lines, query.strip())[:SEARCH_LIMIT]
+        body = "\n".join(matches) if matches else "No matches"
+        self.query_one("#detail-search-results", Static).update(body)
+
+
+class DetailScreen(Screen[None]):
+    CSS = """
+    #detail-body {
+        padding: 1;
+        overflow-y: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("s", "open_search", "Search"),
+        Binding("slash", "open_search", "Search"),
+    ]
+
+    def __init__(self, title: str, content: str) -> None:
+        super().__init__()
+        self.detail_title = title
+        self.detail_content = content
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Vertical(Static(self.detail_content, id="detail-body"))
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = self.detail_title
+
+    async def action_open_search(self) -> None:
+        query = await self.app.push_screen_wait(DetailSearchScreen(self.detail_content))
+        if query:
+            lines = filter_detail_lines(plain_text_lines(self.detail_content), query)
+            self.query_one("#detail-body", Static).update("\n".join(lines) if lines else "No matches")
+
+
 def row_key(session: str, idx: str) -> str:
     return f"{session}:{idx}"
 
@@ -1057,6 +1274,8 @@ class SessionsTableApp(App[None]):
         Binding("enter", "open_selected", "Open"),
         Binding("s", "open_search", "Search"),
         Binding("slash", "open_search", "Search"),
+        Binding("b", "open_bead_search", "Beads"),
+        Binding("p", "open_pr_search", "PRs"),
         Binding("r", "refresh_rows", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
@@ -1071,6 +1290,9 @@ class SessionsTableApp(App[None]):
         self.activity_histories: dict[tuple[str, str], deque[int]] = {}
         self.row_to_detail: dict[str, str] = {}
         self.search_rows: list[tuple[str, str, str]] = []
+        self.row_to_session_detail: dict[str, str] = {}
+        self.bead_rows: list[tuple[str, str, str]] = []
+        self.pr_rows: list[tuple[str, str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1116,12 +1338,16 @@ class SessionsTableApp(App[None]):
 
         bead_assignments = load_bead_assignments()
         in_progress_beads, queued_beads = load_bead_status_tables()
+        pending_prs = load_pending_prs()
         active_bead_ids = {issue_id for _, issue_id, _ in in_progress_beads + queued_beads}
 
         table = self.query_one("#sessions", DataTable)
         table.clear(columns=False)
         self.row_to_detail.clear()
+        self.row_to_session_detail.clear()
         self.search_rows.clear()
+        self.bead_rows = []
+        self.pr_rows = pending_prs
 
         current_prefix = None
         for session, idx in sorted(self.birth_times, key=lambda k: (k[0], self.birth_times[k])):
@@ -1178,6 +1404,7 @@ class SessionsTableApp(App[None]):
                 self.activity_histories.get((session, idx), deque()),
             )
             self.row_to_detail[key_value] = detail
+            self.row_to_session_detail[key_value] = detail
             self.search_rows.append(
                 (
                     key_value,
@@ -1185,6 +1412,16 @@ class SessionsTableApp(App[None]):
                     f"{session:<20} {prefix:<8} {bead_id:<14} {title or '-'}",
                 )
             )
+
+            if bead_id and bead_id != "-":
+                clean_bead_id = bead_id.removesuffix(" (stale)")
+                self.bead_rows.append(
+                    (
+                        clean_bead_id,
+                        " ".join([clean_bead_id, title or "", session, prefix]),
+                        f"{clean_bead_id:<14} {session:<20} {title or '-'}",
+                    )
+                )
 
         if table.row_count:
             first_key = next(iter(self.row_to_detail), None)
@@ -1204,8 +1441,11 @@ class SessionsTableApp(App[None]):
         if table.cursor_row is None:
             return
         row_key_value = table.get_row_key(table.cursor_row)
-        if row_key_value is not None and row_key_value.value in self.row_to_detail:
-            self.query_one("#detail", Static).update(self.row_to_detail[row_key_value.value])
+        if row_key_value is None:
+            return
+        key = row_key_value.value
+        if key in self.row_to_session_detail:
+            self.push_screen(DetailScreen(f"Session Detail: {key}", self.row_to_session_detail[key]))
 
     async def action_open_search(self) -> None:
         result = await self.push_screen_wait(SearchScreen(self.search_rows))
@@ -1223,6 +1463,27 @@ class SessionsTableApp(App[None]):
         row_key_value = event.row_key.value
         if row_key_value in self.row_to_detail:
             self.query_one("#detail", Static).update(self.row_to_detail[row_key_value])
+
+    async def action_open_bead_search(self) -> None:
+        result = await self.push_screen_wait(SearchScreen(self.bead_rows))
+        if not result:
+            return
+        self.push_screen(DetailScreen(f"Bead Detail: {result}", load_bead_detail_text(result)))
+
+    async def action_open_pr_search(self) -> None:
+        rows = [
+            (
+                f"{rig_name}:{identifier}",
+                " ".join([rig_name, identifier, title]),
+                f"{rig_name:<12} {identifier:<10} {title}",
+            )
+            for rig_name, identifier, title in self.pr_rows
+        ]
+        result = await self.push_screen_wait(SearchScreen(rows))
+        if not result:
+            return
+        rig_name, identifier = result.split(":", 1)
+        self.push_screen(DetailScreen(f"PR Detail: {identifier}", load_pr_detail_text(rig_name, identifier)))
 
 
 def build_table(
