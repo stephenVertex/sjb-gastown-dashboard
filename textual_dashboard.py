@@ -27,12 +27,85 @@ from dashboard_data import DashboardDataStore, DashboardSnapshot, GT_ROOT, POLL_
 from rigs_screen import RigsScreen
 
 
+PANEL_ACCENTS = {
+    "windows": "cyan",
+    "worked": "green",
+    "queue": "yellow",
+    "closed": "magenta",
+    "detail": "blue",
+    "prs": "bright_cyan",
+}
+
+
+def _priority_markup(priority: str) -> str:
+    value = str(priority).strip()
+    if not value:
+        return ""
+    color = {
+        "0": "bright_red",
+        "1": "red",
+        "2": "dark_orange",
+        "3": "yellow",
+        "4": "green",
+    }.get(value, "cyan")
+    return f"[{color}]P{value}[/]"
+
+
+def _status_markup(status: str) -> str:
+    value = status.strip()
+    if not value:
+        return ""
+    color = {
+        "hooked": "green",
+        "in_progress": "green",
+        "queued": "yellow",
+        "open": "cyan",
+        "closed": "dim",
+        "blocked": "red",
+        "deferred": "magenta",
+    }.get(value.lower(), "white")
+    return f"[{color}]{value}[/]"
+
+
+def _age_markup(age_secs: float) -> str:
+    if age_secs < 300:
+        color = "green"
+    elif age_secs < 3600:
+        color = "yellow"
+    elif age_secs < 86400:
+        color = "dark_orange"
+    else:
+        color = "red"
+    return f"[{color}]{fmt_age(age_secs)}[/]"
+
+
+def _session_markup(session: str) -> str:
+    if not session:
+        return ""
+    lowered = session.lower()
+    if any(word in lowered for word in ("polecat", "refinery", "mayor", "witness")):
+        color = "green"
+    else:
+        color = "cyan"
+    return f"[{color}]{session}[/]"
+
+
+def _bead_markup(bead_id: str) -> str:
+    if not bead_id or bead_id == "-":
+        return "[dim]-[/]"
+    return f"[yellow]{bead_id}[/]"
+
+
+def _title_markup(title: str) -> str:
+    return f"[bold white]{title}[/]" if title else ""
+
+
 def format_rows(rows: list[tuple[str, str, str]], empty: str, limit: int) -> str:
     if not rows:
-        return empty
-    rendered = [f"{rig:<8} {bead:<18} {title}" for rig, bead, title in rows[:limit]]
+        return f"[dim]{empty}[/]"
+    rendered = [f"[cyan]{rig:<8}[/] {_bead_markup(bead)} {_title_markup(title)}" for rig, bead, title in rows[:limit]]
     if len(rows) > limit:
-        rendered.append(f"+{len(rows) - limit} more")
+        rendered.append(f"[dim]+{len(rows) - limit} more[/]")
     return "\n".join(rendered)
 
 
@@ -50,7 +123,10 @@ def build_windows_text(snapshot: DashboardSnapshot) -> str:
                 label = issue_id
                 break
         title_text = title or path or ""
-        lines.append(f"{session:<18} {idx:>2} {name:<10} {cmd:<10} {label:<12} {fmt_age(age_secs):>10}  {title_text}")
+        lines.append(
+            f"{_session_markup(session):<28} [cyan]{idx:>2}[/] [magenta]{name:<10}[/] [blue]{cmd:<10}[/] "
+            f"{_bead_markup(label):<20} {_age_markup(age_secs):>24}  [white]{title_text}[/]"
+        )
     return "\n".join(lines)
 
 
@@ -73,16 +149,16 @@ def _format_relative_age(value: str) -> str:
 def _format_dependency_lines(items: list[dict], label: str) -> list[str]:
     if not items:
         return []
-    lines = [f"{label}:"]
+    lines = [f"[bold]{label}:[/]" ]
     for item in items:
         dep_id = item.get("id", "?")
         title = item.get("title", "")
         status = item.get("status", "")
-        piece = f"- {dep_id}"
+        piece = f"- {_bead_markup(dep_id)}"
         if title:
-            piece += f"  {title}"
+            piece += f"  {_title_markup(title)}"
         if status:
-            piece += f" [{status}]"
+            piece += f"  {_status_markup(status)}"
         lines.append(piece)
     return lines
 
@@ -104,44 +180,44 @@ def render_bead_summary(bead: dict, session_name: str = "") -> str:
     dependencies = bead.get("dependencies") or []
     dependents = bead.get("dependents") or []
 
-    lines = [f"{bead_id}  {title}".rstrip()]
+    lines = [f"{_bead_markup(bead_id)}  {_title_markup(title)}".rstrip()]
     meta = []
     if rig:
-        meta.append(f"rig: {rig_abbrev(rig)}")
+        meta.append(f"rig: [cyan]{rig_abbrev(rig)}[/]")
     if session_name:
-        meta.append(f"session: {session_name}")
+        meta.append(f"session: {_session_markup(session_name)}")
     if status:
-        meta.append(f"status: {status}")
+        meta.append(f"status: {_status_markup(status)}")
     if priority != "":
-        meta.append(f"priority: P{priority}")
+        meta.append(f"priority: {_priority_markup(priority)}")
     if bead_type:
-        meta.append(f"type: {bead_type}")
+        meta.append(f"type: [magenta]{bead_type}[/]")
     if meta:
         lines.append("  ".join(meta))
 
     people = []
     if assignee:
-        people.append(f"assignee: {assignee}")
+        people.append(f"assignee: [green]{assignee}[/]")
     if owner:
-        people.append(f"owner: {owner}")
+        people.append(f"owner: [cyan]{owner}[/]")
     if people:
         lines.append("  ".join(people))
 
     timing = []
     if created:
-        timing.append(f"created: {created}")
+        timing.append(f"created: [yellow]{created}[/]")
     if updated:
-        timing.append(f"updated: {updated}")
+        timing.append(f"updated: [green]{updated}[/]")
     if timing:
         lines.append("  ".join(timing))
 
     if labels:
         lines.append("")
-        lines.append("labels: " + ", ".join(str(label) for label in labels))
+        lines.append("labels: " + ", ".join(f"[magenta]{label}[/]" for label in labels))
 
     if description:
         lines.append("")
-        lines.append("description:")
+        lines.append("[bold]description:[/]")
         lines.extend(description.splitlines())
 
     dep_lines = _format_dependency_lines(dependencies, "dependencies")
@@ -155,14 +231,14 @@ def render_bead_summary(bead: dict, session_name: str = "") -> str:
 
     if comments:
         lines.append("")
-        lines.append("comments:")
+        lines.append("[bold]comments:[/]")
         for comment in comments:
             author = comment.get("author") or comment.get("created_by") or "unknown"
             body = (comment.get("body") or comment.get("comment") or "").strip()
             created_at = _format_relative_age(comment.get("created_at", ""))
-            header = f"- {author}"
+            header = f"- [cyan]{author}[/]"
             if created_at:
-                header += f" ({created_at})"
+                header += f" ([yellow]{created_at}[/])"
             lines.append(header)
             if body:
                 lines.extend(f"  {line}" for line in body.splitlines())
@@ -181,7 +257,7 @@ def _bead_search_rows(snapshot: DashboardSnapshot) -> list[tuple[str, str, str]]
         rig = bead.get("_rig", "")
         title = bead.get("title", "")
         status = bead.get("status", "")
-        display = f"{bead_id:<18} {status:<10} {rig_abbrev(rig):<8} {title}".rstrip()
+        display = f"{_bead_markup(bead_id)} {_status_markup(status):<22} [cyan]{rig_abbrev(rig):<8}[/] {_title_markup(title)}".rstrip()
         rows.append((bead_id, title, display))
     return rows
 
@@ -243,7 +319,7 @@ class BeadSearchScreen(ModalScreen[str | None]):
 
     def _update_results(self, query: str) -> None:
         matches = self._matches(query.strip().lower())
-        body = "\n".join(row[2] for row in matches) if matches else "No matches"
+        body = "\n".join(row[2] for row in matches) if matches else "[dim]No matches[/]"
         self.query_one("#search-results", Static).update(body)
 
 
@@ -448,6 +524,7 @@ class GastownDashboard(App):
         for panel_id, title in (("windows", "Windows"), ("worked", "Worked Now"), ("queue", "Queue"), ("closed", "Recently Closed"), ("detail", detail_title), ("prs", "Pending PRs")):
             panel = self.query_one(f"#{panel_id}", VerticalScroll)
             panel.border_title = title
+            panel.styles.border = ("round", PANEL_ACCENTS.get(panel_id, "cyan"))
 
 
 def main() -> None:
