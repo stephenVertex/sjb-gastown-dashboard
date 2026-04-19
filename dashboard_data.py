@@ -38,6 +38,12 @@ GT_ROOT = Path.home() / "gt"
 XDG_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
 STATE_DIR = XDG_STATE_DIR / "gastown"
 
+GT_AUTO_PLUGIN_TITLES = {
+    "Plugin crash (blocks boot)",
+    "Plugin stderr on startup",
+    "Plugin timed out during startup",
+}
+
 WindowKey = tuple[str, str]
 WindowInfo = tuple[str, str, str, str, str]
 
@@ -322,11 +328,14 @@ def load_bead_status_tables() -> tuple[list[tuple[str, str, str]], list[tuple[st
             continue
         rig_name = rig_dir.name
         for issue_id, title in run_bd_list(beads_root, "in_progress"):
-            in_progress.append((rig_name, issue_id, title))
+            if include_cross_rig_bead(rig_name, issue_id, title):
+                in_progress.append((rig_name, issue_id, title))
         for issue_id, title in run_bd_list(beads_root, "hooked"):
-            in_progress.append((rig_name, issue_id, title))
+            if include_cross_rig_bead(rig_name, issue_id, title):
+                in_progress.append((rig_name, issue_id, title))
         for issue_id, title in run_bd_list(beads_root, "open"):
-            queue.append((rig_name, issue_id, title))
+            if include_cross_rig_bead(rig_name, issue_id, title):
+                queue.append((rig_name, issue_id, title))
     deduped_in_progress: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for rig_name, issue_id, title in in_progress:
@@ -386,7 +395,9 @@ def load_recently_closed_beads() -> list[tuple[str, str, str]]:
             issue_id = parts[1]
             if "-wisp-" in issue_id:
                 continue
-            results.append((rig_name, issue_id, parts[3]))
+            title = parts[3]
+            if include_cross_rig_bead(rig_name, issue_id, title):
+                results.append((rig_name, issue_id, title))
     _closed_cache = results
     _closed_cache_time = now
     return results
@@ -430,6 +441,8 @@ def load_bead_details() -> list[dict]:
                 records = json.loads(result.stdout)
                 if records and isinstance(records, list):
                     rec = records[0]
+                    if not include_cross_rig_bead_record(rig_name, rec):
+                        continue
                     rec["_rig"] = rig_name
                     details.append(rec)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
@@ -437,6 +450,30 @@ def load_bead_details() -> list[dict]:
     _bead_detail_cache = details
     _bead_detail_cache_time = now
     return details
+
+
+def include_cross_rig_bead(rig_name: str, issue_id: str, title: str) -> bool:
+    if not issue_id.startswith("gt-"):
+        return True
+    lowered_title = title.lower()
+    if title in GT_AUTO_PLUGIN_TITLES:
+        return False
+    if lowered_title.startswith("ci failure:"):
+        return False
+    if lowered_title.startswith("gt:rig ") or lowered_title.startswith("gt:agent "):
+        return False
+    return True
+
+
+def include_cross_rig_bead_record(rig_name: str, record: dict) -> bool:
+    issue_id = str(record.get("id", ""))
+    title = str(record.get("title", ""))
+    if not include_cross_rig_bead(rig_name, issue_id, title):
+        return False
+    labels = {str(label).lower() for label in record.get("labels") or []}
+    if issue_id.startswith("gt-") and "ci-failure" in labels:
+        return False
+    return True
 
 
 def parse_github_repo(remote_url: str) -> str | None:

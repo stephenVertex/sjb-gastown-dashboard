@@ -23,6 +23,12 @@ from textual.widgets import Input, Static
 
 GT_ROOT = Path.home() / "gt"
 
+GT_AUTO_PLUGIN_TITLES = {
+    "Plugin crash (blocks boot)",
+    "Plugin stderr on startup",
+    "Plugin timed out during startup",
+}
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -54,6 +60,8 @@ def load_all_beads() -> list[dict]:
                 bead_id = rec.get("id", "")
                 if bead_id in seen or "-wisp-" in bead_id:
                     continue
+                if not include_cross_rig_bead_record(rig_name, rec):
+                    continue
                 seen.add(bead_id)
                 rec["_rig"] = rig_name
                 beads.append(rec)
@@ -84,6 +92,31 @@ def fetch_bead_detail(bead_id: str) -> str:
         except (subprocess.TimeoutExpired, OSError):
             continue
     return f"Bead {bead_id!r} not found in any rig."
+
+
+def include_cross_rig_bead(issue_id: str, title: str) -> bool:
+    if not issue_id.startswith("gt-"):
+        return True
+    lowered_title = title.lower()
+    if title in GT_AUTO_PLUGIN_TITLES:
+        return False
+    if lowered_title.startswith("ci failure:"):
+        return False
+    if lowered_title.startswith("gt:rig ") or lowered_title.startswith("gt:agent "):
+        return False
+    return True
+
+
+def include_cross_rig_bead_record(rig_name: str, record: dict) -> bool:
+    del rig_name
+    issue_id = str(record.get("id", ""))
+    title = str(record.get("title", ""))
+    if not include_cross_rig_bead(issue_id, title):
+        return False
+    labels = {str(label).lower() for label in record.get("labels") or []}
+    if issue_id.startswith("gt-") and "ci-failure" in labels:
+        return False
+    return True
 
 
 def format_suggestion(rec: dict) -> str:
