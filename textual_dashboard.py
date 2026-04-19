@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import subprocess
 import time
+from collections import deque
 from datetime import datetime
 
 from textual import on
@@ -23,7 +24,17 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, Static
 
-from dashboard_data import DashboardDataStore, DashboardSnapshot, GT_ROOT, POLL_INTERVAL, fmt_age, rig_abbrev
+from dashboard_data import (
+    BAR_WIDTH,
+    DashboardDataStore,
+    DashboardSnapshot,
+    GT_ROOT,
+    POLL_INTERVAL,
+    activity_label,
+    age_color,
+    fmt_age,
+    rig_abbrev,
+)
 from rigs_screen import RigsScreen
 
 
@@ -40,17 +51,34 @@ def build_windows_text(snapshot: DashboardSnapshot) -> str:
     if not snapshot.birth_times:
         return "No tmux windows"
 
+    max_age = max(
+        ((snapshot.refreshed_at - birth_time).total_seconds() for birth_time in snapshot.birth_times.values()),
+        default=1,
+    ) or 1
     lines: list[str] = []
+    lines.append(
+        f"{'SESSION':<18} {'IDX':>3} {'WINDOW':<10} {'ACT':<7} {'BEAD':<12} {'AGE':>10} {'BAR':<{BAR_WIDTH}} TITLE"
+    )
     for session, idx in sorted(snapshot.birth_times, key=lambda item: (item[0], snapshot.birth_times[item])):
         name, cmd, path, title, _pane_id = snapshot.windows.get((session, idx), ("?", "?", "?", "", ""))
         age_secs = (snapshot.refreshed_at - snapshot.birth_times[(session, idx)]).total_seconds()
+        activity_scores = snapshot.activity_histories.get((session, idx), deque())
+        avg_activity = int(sum(activity_scores) / len(activity_scores)) if activity_scores else 0
+        act_text, _act_color = activity_label(avg_activity)
+        age_display = fmt_age(age_secs)
+        _age_tint = age_color(age_secs)
+        bar_len = min(BAR_WIDTH, int(BAR_WIDTH * age_secs / max_age))
+        bar = "#" * bar_len + "." * (BAR_WIDTH - bar_len)
         label = "-"
         for (rig_name, issue_id), session_name in snapshot.bead_to_session.items():
             if session_name == session:
                 label = issue_id
                 break
         title_text = title or path or ""
-        lines.append(f"{session:<18} {idx:>2} {name:<10} {cmd:<10} {label:<12} {fmt_age(age_secs):>10}  {title_text}")
+        display_name = "claude" if name == "node" else name
+        lines.append(
+            f"{session:<18} {idx:>3} {display_name:<10} {act_text:<7} {label:<12} {age_display:>10} {bar:<{BAR_WIDTH}} {title_text}"
+        )
     return "\n".join(lines)
 
 
