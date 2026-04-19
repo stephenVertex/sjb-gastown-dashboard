@@ -56,7 +56,7 @@ class DashboardSnapshot:
     bead_assignments: dict[tuple[str, str], str]
     in_progress_beads: list[tuple[str, str, str]]
     queued_beads: list[tuple[str, str, str]]
-    recently_closed: list[tuple[str, str, str]]
+    recently_closed: list[tuple[str, str, str, str]]
     pending_prs: list[tuple[str, str, str]]
     bead_details: list[dict]
     bead_to_session: dict[tuple[str, str], str]
@@ -338,17 +338,17 @@ def load_bead_status_tables() -> tuple[list[tuple[str, str, str]], list[tuple[st
     return deduped_in_progress, queue
 
 
-_closed_cache: list[tuple[str, str, str]] = []
+_closed_cache: list[tuple[str, str, str, str]] = []
 _closed_cache_time: float = 0
 
 
-def load_recently_closed_beads() -> list[tuple[str, str, str]]:
+def load_recently_closed_beads() -> list[tuple[str, str, str, str]]:
     global _closed_cache, _closed_cache_time
     now = time.time()
     if now - _closed_cache_time < PR_REFRESH_INTERVAL:
         return _closed_cache
     cutoff = (datetime.now() - timedelta(days=CLOSED_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[str, str, str, str]] = []
     for rig_dir in sorted(GT_ROOT.iterdir()):
         if not rig_dir.is_dir():
             continue
@@ -383,10 +383,11 @@ def load_recently_closed_beads() -> list[tuple[str, str, str]]:
             parts = stripped.split(maxsplit=3)
             if len(parts) < 4:
                 continue
+            closed_at = parts[0]
             issue_id = parts[1]
             if "-wisp-" in issue_id:
                 continue
-            results.append((rig_name, issue_id, parts[3]))
+            results.append((rig_name, issue_id, closed_at, parts[3]))
     _closed_cache = results
     _closed_cache_time = now
     return results
