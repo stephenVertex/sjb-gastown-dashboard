@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Provider, Hits, Hit
@@ -103,6 +104,14 @@ class GastownDashboard(App):
         padding: 0 1;
     }
 
+    .panel:focus {
+        border: heavy $success;
+        background: $success 10%;
+        border-title-color: $success;
+        border-title-style: bold;
+        border-title-background: $boost;
+    }
+
     #windows {
         height: 2fr;
     }
@@ -153,12 +162,14 @@ class GastownDashboard(App):
         self.sub_title = f"Refresh {self.refresh_interval}s"
         self.set_interval(self.refresh_interval, self.refresh_data)
         self.refresh_data()
+        self.action_focus_panel("windows")
 
     def on_unmount(self) -> None:
         self.store.close()
 
     def action_focus_panel(self, panel_id: str) -> None:
         self.query_one(f"#{panel_id}", VerticalScroll).focus()
+        self._update_panel_titles()
 
     def action_show_rigs(self) -> None:
         self.push_screen(RigsScreen())
@@ -177,9 +188,18 @@ class GastownDashboard(App):
         self.query_one("#closed-content", Static).update(format_rows(snapshot.recently_closed, "Nothing recently closed", 8))
         self.query_one("#detail-content", Static).update(build_detail_text(snapshot))
         self.query_one("#prs-content", Static).update(format_rows(snapshot.pending_prs, "No pending PRs", 12))
+        self._update_panel_titles()
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        self._update_panel_titles()
+
+    def on_descendant_blur(self, event: events.DescendantBlur) -> None:
+        self._update_panel_titles()
+
+    def _update_panel_titles(self) -> None:
         for panel_id, title in (("windows", "Windows"), ("worked", "Worked Now"), ("queue", "Queue"), ("closed", "Recently Closed"), ("detail", "Bead Detail"), ("prs", "Pending PRs")):
             panel = self.query_one(f"#{panel_id}", VerticalScroll)
-            panel.border_title = title
+            panel.border_title = f"▶ {title} ◀" if panel.has_focus else title
 
 
 def main() -> None:
