@@ -13,6 +13,9 @@ import subprocess
 import time
 from datetime import datetime
 
+from rich.console import Group, RenderableType
+from rich.table import Table
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -27,31 +30,58 @@ from dashboard_data import DashboardDataStore, DashboardSnapshot, GT_ROOT, POLL_
 from rigs_screen import RigsScreen
 
 
-def format_rows(rows: list[tuple[str, str, str]], empty: str, limit: int) -> str:
+def _row_table(columns: list[tuple[str, str]]) -> Table:
+    table = Table.grid(padding=(0, 1), expand=True)
+    for _, justify in columns:
+        table.add_column(justify=justify, overflow="ellipsis", no_wrap=True)
+    return table
+
+
+def format_rows(
+    rows: list[tuple[str, str, str]], empty: str, limit: int
+) -> RenderableType:
     if not rows:
-        return empty
-    rendered = [f"{rig:<8} {bead:<18} {title}" for rig, bead, title in rows[:limit]]
+        return Text(empty, style="dim")
+    table = _row_table([("rig", "left"), ("bead", "left"), ("title", "left")])
+    for rig, bead, title in rows[:limit]:
+        table.add_row(Text(rig_abbrev(rig), style="cyan"), Text(bead, style="bold"), title)
     if len(rows) > limit:
-        rendered.append(f"+{len(rows) - limit} more")
-    return "\n".join(rendered)
+        return Group(table, Text(f"+{len(rows) - limit} more", style="dim"))
+    return table
 
 
-def build_windows_text(snapshot: DashboardSnapshot) -> str:
+def build_windows_text(snapshot: DashboardSnapshot) -> RenderableType:
     if not snapshot.birth_times:
-        return "No tmux windows"
+        return Text("No tmux windows", style="dim")
 
-    lines: list[str] = []
+    session_for_bead = {session_name: issue_id for (_rig, issue_id), session_name in snapshot.bead_to_session.items()}
+
+    table = _row_table(
+        [
+            ("session", "left"),
+            ("idx", "right"),
+            ("name", "left"),
+            ("cmd", "left"),
+            ("bead", "left"),
+            ("age", "right"),
+            ("title", "left"),
+        ]
+    )
     for session, idx in sorted(snapshot.birth_times, key=lambda item: (item[0], snapshot.birth_times[item])):
         name, cmd, path, title, _pane_id = snapshot.windows.get((session, idx), ("?", "?", "?", "", ""))
         age_secs = (snapshot.refreshed_at - snapshot.birth_times[(session, idx)]).total_seconds()
-        label = "-"
-        for (rig_name, issue_id), session_name in snapshot.bead_to_session.items():
-            if session_name == session:
-                label = issue_id
-                break
+        label = session_for_bead.get(session, "-")
         title_text = title or path or ""
-        lines.append(f"{session:<18} {idx:>2} {name:<10} {cmd:<10} {label:<12} {fmt_age(age_secs):>10}  {title_text}")
-    return "\n".join(lines)
+        table.add_row(
+            Text(session, style="cyan"),
+            str(idx),
+            name,
+            cmd,
+            Text(label, style="bold" if label != "-" else "dim"),
+            fmt_age(age_secs),
+            title_text,
+        )
+    return table
 
 
 def _format_relative_age(value: str) -> str:
