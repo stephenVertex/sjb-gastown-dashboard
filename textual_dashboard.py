@@ -13,6 +13,7 @@ import subprocess
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -22,7 +23,7 @@ from textual.containers import Container, Vertical, Horizontal, VerticalScroll
 from textual.events import Key
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from dashboard_data import (
     BAR_WIDTH,
@@ -30,6 +31,7 @@ from dashboard_data import (
     DashboardSnapshot,
     GT_ROOT,
     POLL_INTERVAL,
+    PendingPR,
     activity_label,
     age_color,
     fmt_age,
@@ -45,6 +47,75 @@ def format_rows(rows: list[tuple[str, str, str]], empty: str, limit: int) -> str
     if len(rows) > limit:
         rendered.append(f"+{len(rows) - limit} more")
     return "\n".join(rendered)
+
+
+def _pr_search_rows(snapshot: DashboardSnapshot) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for pr in snapshot.pending_prs:
+        token = f"{pr.rig} {pr.identifier} {pr.title} {pr.head_ref}".strip()
+        display = f"{pr.identifier:<8} {rig_abbrev(pr.rig):<8} {pr.status:<8} {pr.title}"
+        rows.append((pr.identifier, token, display))
+    return rows
+
+
+def render_pending_pr_detail(pr: PendingPR) -> str:
+    lines = [f"{pr.identifier}  {pr.title}".rstrip()]
+    meta = [f"rig: {rig_abbrev(pr.rig)}", f"status: {pr.status}"]
+    if pr.age:
+        meta.append(f"age: {pr.age}")
+    if pr.checks_status:
+        meta.append(f"checks: {pr.checks_status}")
+    if pr.review_state:
+        meta.append(f"review: {pr.review_state}")
+    lines.append("  ".join(meta))
+    if pr.head_ref:
+        lines.append(f"branch: {pr.head_ref}")
+    if pr.url:
+        lines.append(f"url: {pr.url}")
+    if pr.description:
+        lines.append("")
+        lines.append("description:")
+        lines.extend(pr.description.splitlines())
+    return "\n".join(lines)
+
+
+class PRSearchScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+
+    def __init__(self, rows: list[tuple[str, str, str]]) -> None:
+        super().__init__()
+        self.rows = rows
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Input(placeholder="Search PR title, number, or rig", id="pr-search-input"),
+            Static(id="pr-search-results"),
+            id="search-modal",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#pr-search-input", Input).focus()
+        self._update_results("")
+
+    @on(Input.Changed, "#pr-search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._update_results(event.value)
+
+    @on(Input.Submitted, "#pr-search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip().lower()
+        matches = self._matches(query)
+        self.dismiss(matches[0][0] if matches else None)
+
+    def _matches(self, query: str) -> list[tuple[str, str, str]]:
+        if not query:
+            return self.rows[:20]
+        return [row for row in self.rows if query in row[1].lower()][:20]
+
+    def _update_results(self, query: str) -> None:
+        matches = self._matches(query.strip().lower())
+        body = "\n".join(row[2] for row in matches) if matches else "No matches"
+        self.query_one("#pr-search-results", Static).update(body)
 
 
 def build_windows_text(snapshot: DashboardSnapshot) -> str:
@@ -287,6 +358,7 @@ class DashboardCommands(Provider):
             ("detail", "Focus bead detail panel"),
             ("prs", "Focus pending PRs panel"),
             ("bd", "Focus bead detail panel"),
+            ("pr", "Focus pending PRs panel"),
         ]
         for panel_id, help_text in items:
             if query and query.lower() not in panel_id:
@@ -350,6 +422,9 @@ class GastownDashboard(App):
         Binding("5", "focus_panel('detail')", "Detail"),
         Binding("6", "focus_panel('prs')", "PRs"),
         Binding("s", "detail_search", "Search Beads"),
+        Binding("p", "pr_search", "Search PRs"),
+        Binding("enter", "open_selected_pr", "Open PR Detail"),
+        Binding("o", "open_pr_in_browser", "Open PR in Browser"),
         Binding("r", "show_rigs", "Rigs"),
     ]
 
@@ -364,6 +439,9 @@ class GastownDashboard(App):
         self._last_detail_switch = 0.0
         self._detail_pinned_id: str | None = None
         self._detail_pinned_text = ""
+        self._prs_table = DataTable(id="prs-table", zebra_stripes=True, cursor_type="row")
+        self._pr_rows: dict[str, PendingPR] = {}
+        self._pr_detail_text = "Select a PR to view details"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -381,12 +459,14 @@ class GastownDashboard(App):
                 with VerticalScroll(id="detail", classes="panel", can_focus=True):
                     yield Static("Loading...", id="detail-content")
                 with VerticalScroll(id="prs", classes="panel", can_focus=True):
-                    yield Static("Loading...", id="prs-content")
+                    yield self._prs_table
+                    yield Static("Select a PR to view details", id="prs-detail")
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = f"Textual Dashboard [{self.socket}]"
         self.sub_title = f"Refresh {self.refresh_interval}s"
+        self._prs_table.add_columns("PR", "Title", "Rig", "Status", "Age")
         self.set_interval(self.refresh_interval, self.refresh_data)
         self.refresh_data()
 
@@ -408,12 +488,42 @@ class GastownDashboard(App):
     def action_show_rigs(self) -> None:
         self.push_screen(RigsScreen())
 
+    async def action_pr_search(self) -> None:
+        snapshot = self.snapshot
+        if snapshot is None:
+            return
+        rows = _pr_search_rows(snapshot)
+        if not rows:
+            return
+        result = await self.push_screen_wait(PRSearchScreen(rows))
+        if result:
+            self._focus_pr_by_identifier(result)
+
+    def action_open_selected_pr(self) -> None:
+        if self.focused is not self._prs_table:
+            return
+        self._update_selected_pr_detail()
+
+    def action_open_pr_in_browser(self) -> None:
+        pr = self._current_pending_pr()
+        if pr is None or not pr.url:
+            return
+        try:
+            subprocess.Popen(["open", pr.url], cwd=str(Path.cwd()), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+
     def on_key(self, event: Key) -> None:
         if event.key == "escape" and self._detail_pinned_id and self.screen is self.screen_stack[0]:
             self._detail_pinned_id = None
             self._detail_pinned_text = ""
             self._render_snapshot()
             event.stop()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "prs-table":
+            return
+        self._update_selected_pr_detail(event.row_key.value)
 
     def refresh_data(self) -> None:
         self.snapshot = self.store.refresh()
@@ -460,6 +570,36 @@ class GastownDashboard(App):
             return self._detail_pinned_text or f"Loading {self._detail_pinned_id}..."
         return self._build_rotating_detail_text(snapshot)
 
+    def _current_pending_pr(self) -> PendingPR | None:
+        row = self._prs_table.cursor_row
+        if row is None:
+            return None
+        row_key = self._prs_table.get_row_key(row)
+        if row_key is None:
+            return None
+        return self._pr_rows.get(row_key.value)
+
+    def _update_selected_pr_detail(self, row_key: str | None = None) -> None:
+        pr: PendingPR | None = None
+        if row_key is not None:
+            pr = self._pr_rows.get(row_key)
+        if pr is None:
+            pr = self._current_pending_pr()
+        self._pr_detail_text = render_pending_pr_detail(pr) if pr else "Select a PR to view details"
+        self.query_one("#prs-detail", Static).update(self._pr_detail_text)
+
+    def _focus_pr_by_identifier(self, identifier: str) -> None:
+        for row_index in range(self._prs_table.row_count):
+            row_key = self._prs_table.get_row_key(row_index)
+            if row_key is None:
+                continue
+            pr = self._pr_rows.get(row_key.value)
+            if pr and pr.identifier == identifier:
+                self.action_focus_panel("prs")
+                self._prs_table.move_cursor(row=row_index)
+                self._update_selected_pr_detail(row_key.value)
+                return
+
     def _render_snapshot(self) -> None:
         if self.snapshot is None:
             return
@@ -469,7 +609,29 @@ class GastownDashboard(App):
         self.query_one("#queue-content", Static).update(format_rows(snapshot.queued_beads, "No queued beads", 8))
         self.query_one("#closed-content", Static).update(format_rows(snapshot.recently_closed, "Nothing recently closed", 8))
         self.query_one("#detail-content", Static).update(self._build_detail_panel_text(snapshot))
-        self.query_one("#prs-content", Static).update(format_rows(snapshot.pending_prs, "No pending PRs", 12))
+        current_identifier = self._current_pending_pr().identifier if self._current_pending_pr() else None
+        self._prs_table.clear()
+        self._pr_rows.clear()
+        for index, pr in enumerate(snapshot.pending_prs):
+            row_key = f"pr-{index}"
+            self._pr_rows[row_key] = pr
+            self._prs_table.add_row(pr.identifier, pr.title, rig_abbrev(pr.rig), pr.status, pr.age, key=row_key)
+        if self._prs_table.row_count:
+            target_row = 0
+            if current_identifier is not None:
+                for row_index in range(self._prs_table.row_count):
+                    row_key = self._prs_table.get_row_key(row_index)
+                    if row_key is None:
+                        continue
+                    pr = self._pr_rows.get(row_key.value)
+                    if pr and pr.identifier == current_identifier:
+                        target_row = row_index
+                        break
+            self._prs_table.move_cursor(row=target_row)
+            self._update_selected_pr_detail()
+        else:
+            self._pr_detail_text = "No pending PRs"
+            self.query_one("#prs-detail", Static).update(self._pr_detail_text)
         detail_title = "Bead Detail"
         if self._detail_pinned_id:
             detail_title = f"Bead Detail [pinned: {self._detail_pinned_id}]"

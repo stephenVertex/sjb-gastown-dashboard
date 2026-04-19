@@ -57,7 +57,7 @@ class DashboardSnapshot:
     in_progress_beads: list[tuple[str, str, str]]
     queued_beads: list[tuple[str, str, str]]
     recently_closed: list[tuple[str, str, str]]
-    pending_prs: list[tuple[str, str, str]]
+    pending_prs: list[PendingPR]
     bead_details: list[dict]
     bead_to_session: dict[tuple[str, str], str]
     active_bead_ids: set[str]
@@ -444,17 +444,88 @@ def parse_github_repo(remote_url: str) -> str | None:
     return match.group(1) if match else None
 
 
-_pr_cache: list[tuple[str, str, str]] = []
+@dataclass(frozen=True)
+class PendingPR:
+    rig: str
+    kind: str
+    number: int | None
+    title: str
+    status: str
+    age: str
+    url: str
+    checks_status: str
+    review_state: str
+    head_ref: str
+    description: str
+
+    @property
+    def identifier(self) -> str:
+        if self.number is not None:
+            return f"#{self.number}"
+        return self.kind
+
+
+_pr_cache: list[PendingPR] = []
 _pr_cache_time: float = 0
 
 
-def load_pending_prs() -> list[tuple[str, str, str]]:
+def _normalize_pr_status(pr: dict) -> str:
+    state = (pr.get("state") or "").lower()
+    is_draft = bool(pr.get("isDraft"))
+    if is_draft and state == "open":
+        return "draft"
+    return state or "unknown"
+
+
+def _summarize_checks(status_rollup: list[dict] | None) -> str:
+    if not status_rollup:
+        return "none"
+    conclusions = [str(item.get("conclusion") or item.get("state") or "").lower() for item in status_rollup]
+    if any(value in {"failure", "failed", "error", "timed_out", "cancelled", "startup_failure", "action_required"} for value in conclusions):
+        return "failing"
+    if any(value in {"pending", "queued", "in_progress", "requested", "waiting"} for value in conclusions):
+        return "pending"
+    if any(value in {"success", "successful", "neutral", "skipped"} for value in conclusions):
+        return "passing"
+    return "mixed"
+
+
+def _summarize_review_state(reviews: list[dict] | None) -> str:
+    if not reviews:
+        return "none"
+    latest_by_author: dict[str, str] = {}
+    for review in reviews:
+        author = ((review.get("author") or {}).get("login") or "unknown").lower()
+        state = str(review.get("state") or "").upper()
+        if state:
+            latest_by_author[author] = state
+    states = set(latest_by_author.values())
+    if "CHANGES_REQUESTED" in states:
+        return "changes requested"
+    if "APPROVED" in states:
+        return "approved"
+    if states:
+        return "reviewed"
+    return "none"
+
+
+def _format_pr_age(created_at: str) -> str:
+    if not created_at:
+        return ""
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return fmt_age(max(0, time.time() - created.timestamp()))
+
+
+def load_pending_prs() -> list[PendingPR]:
     global _pr_cache, _pr_cache_time
     now = time.time()
     if now - _pr_cache_time < PR_REFRESH_INTERVAL:
         return _pr_cache
-    pr_rows: list[tuple[str, str, str]] = []
-    branch_rows: list[tuple[str, str, str]] = []
+    pr_rows: list[PendingPR] = []
+    branch_rows: list[PendingPR] = []
     for rig_dir in sorted(GT_ROOT.iterdir()):
         if not rig_dir.is_dir():
             continue
@@ -482,7 +553,7 @@ def load_pending_prs() -> list[tuple[str, str, str]]:
                     "--repo",
                     repo_slug,
                     "--json",
-                    "number,title,headRefName",
+                    "number,title,headRefName,url,createdAt,isDraft,state,body,reviews,statusCheckRollup",
                     "--state",
                     "open",
                     "--limit",
@@ -495,7 +566,21 @@ def load_pending_prs() -> list[tuple[str, str, str]]:
             if pr_result.returncode == 0:
                 for pr in json.loads(pr_result.stdout):
                     pr_branches.add(pr.get("headRefName", ""))
-                    pr_rows.append((rig_name, f"#{pr.get('number', 0)}", pr.get("title", "")))
+                    pr_rows.append(
+                        PendingPR(
+                            rig=rig_name,
+                            kind="pr",
+                            number=pr.get("number"),
+                            title=pr.get("title", ""),
+                            status=_normalize_pr_status(pr),
+                            age=_format_pr_age(pr.get("createdAt", "")),
+                            url=pr.get("url", ""),
+                            checks_status=_summarize_checks(pr.get("statusCheckRollup")),
+                            review_state=_summarize_review_state(pr.get("reviews")),
+                            head_ref=pr.get("headRefName", ""),
+                            description=(pr.get("body") or "").strip(),
+                        )
+                    )
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
             pass
         rig_branch_count = 0
@@ -519,7 +604,21 @@ def load_pending_prs() -> list[tuple[str, str, str]]:
                         label = f"{parts[0]} ({parts[1].split('@')[0]})"
                     else:
                         label = parts[0] if parts else branch
-                    branch_rows.append((rig_name, "branch", label))
+                    branch_rows.append(
+                        PendingPR(
+                            rig=rig_name,
+                            kind="branch",
+                            number=None,
+                            title=label,
+                            status="branch",
+                            age="",
+                            url="",
+                            checks_status="n/a",
+                            review_state="n/a",
+                            head_ref=branch,
+                            description="Pushed polecat branch without an open PR.",
+                        )
+                    )
         except (subprocess.TimeoutExpired, OSError):
             pass
     _pr_cache = pr_rows + branch_rows
